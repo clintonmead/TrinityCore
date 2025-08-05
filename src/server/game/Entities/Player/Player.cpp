@@ -6082,12 +6082,102 @@ uint8 GetFishingStepsNeededToLevelUp(uint32 SkillValue)
         return 1;
 
     // @epoch-start
-    return SkillValue / 20;
+    // This is the vanilla formula for >75
+    return (SkillValue - 50) / 25 : 1;
     // @epoch-end
 }
 
 bool Player::UpdateFishingSkill()
 {
+    /*
+     * Casts required per skillup are given by the formula:
+     * 
+     * CastsPerSkillup = (CurrentSkillLevel - 50) / 25
+     * 
+     * So what does that mean? Basically one cast is required at 75, and it goes up by one cast every 25 skill points. So:
+     * 
+     * - Every cast below or at 75 results in a skillup
+     * - At 100 skill, you'll need exactly two casts
+     * - At 125 skill, you'll need exactly three casts
+     * - etc, until at 275 you'll need exactly 9 cases
+     * - and, if you could gain a skill point at 300, that would require 10 casts.
+     * 
+     * The question is, what happens in between?
+     * 
+     * I'm not sure anyone is exactly sure, and is somewhat random 
+     * but what is more certain is that the total casts required only differs by 1
+     *
+     * So, for example, between 75 and 100, you'll need either 1 or 2 casts.
+     * 
+     * I'm going to assume here that this random chance is linear, 
+     * much like how the chance changes linearly for profession skillups through yellow->green->grey.
+     * 
+     * Here's the effect of this:
+     * 
+     * At skill level 76, you'll have a 96% chance that your first cast awards a skill point. Your second cast always awards a skill point.
+     * At skill level 77, you'll have a 92% chance that your first cast awards a skill point. Your second cast always awards a skill point.
+     * ...
+     * At skill level 87 (about half way from 75-100), you'll have a 52% chance that your first cast awards a skill point. Your second cast always awards a skill point.
+     * ... 
+     * At skill level 99, you'll have a 4% chance that your first cast awards a skill point. Your second cast always awards a skill point.
+     * At skill level 100, your first cast will never award a skill point, but your second cast always awards a skill point.
+     * At skill level 101, your first cast will never award a skill point, but your second cast has a 96% chance of awarding a skill point. Your third cast always awards a skill poit
+     * 
+     * Hope you get the idea here. So how do we do this.
+     * 
+     * First, we calculate the MINIMUM casts required, using the formula: 
+     * 
+     * MinimumCastsPerSkillup = rounddown((CurrentSkillLevel - 50) / 25)
+     * (just using integer arithmetic does the rounding for us)
+     * 
+     * Then what we do is calculate the "excess skill" we have over the previous breakpoint. 
+     * 
+     * We can work out the previous breakpoint by reversing the above formula:
+     * 
+     * LastBreakpoint = (MinimumCastsPerSkillup * 25) + 50
+     * 
+     * Then we can work out the excess skill points.
+     * 
+     * ExcessSkill = CurrentSkillLevel - LastBreakpoint
+     * 
+     * And then finally, the percentage chance of a skillup when we're on the "border", i.e. when we've done the minimum number of casts:
+     * 
+     * Chance = 100% - (ExcessSkill * 4%)
+     * 
+     * Lets try this with 110 skill. The skillup chance should be 60%, as we are 40% between 100 skill and 125 skill. 
+     * i.e. we're still closer to 100 skill so _most_ skillups should only require two casts, and in this case by fitting linearly between 100 and 125 we get 60%
+     * 
+     * So:
+     * 
+     * MinimumCastsPerSkillup = rounddown((110 - 50) / 25) = 2
+     * LastBreakpoint = (MinimumCastsPerSkillup * 25) + 50 = (2 * 25) + 50 = 100
+     * ExcessSkill = CurrentSkillLevel - LastBreakpoint = 110 - 100 = 10
+     * Chance = 100% - (10 * 4%) = 60%
+     * 
+     * Lets try 99 skill. For this we expect a minimum of 1 cast but only a 4% chance of that first cast skilling up.
+     * 
+     * MinimumCastsPerSkillup = rounddown((99 - 50) / 25) = 1
+     * LastBreakpoint = (MinimumCastsPerSkillup * 25) + 50 = (1 * 25) + 50 = 75
+     * ExcessSkill = CurrentSkillLevel - LastBreakpoint = 99 - 75 = 24
+     * Chance = 100% - (24 * 4%) = 100% - 96% = 4%
+     *      * 
+     * Lets check we also work at the breakpoints, say 100. For 100 we expect 2 casts pere skillup minimum and a 100% chance of skilling up at the mimimum cast amount.
+     * 
+     * MinimumCastsPerSkillup = rounddown((100 - 50) / 25) = 2
+     * LastBreakpoint = (MinimumCastsPerSkillup * 25) + 50 = (2 * 25) + 50 = 100
+     * ExcessSkill = CurrentSkillLevel - LastBreakpoint = 100 - 100 = 0
+     * Chance = 100% - (0 * 4%) = 100%
+     * 
+     * Perfect!
+     * 
+     * The code below implements this.
+     * 
+     * For evidence this is how it was done in vanilla:
+     * 
+     * 1. This is how I remember it working pretty distinctly in Classic Era. 
+     *    In particular the addon FishingBuddy would track your casts per skillup and I recall it matching the above formula pretty spot on.
+     * 2. El's Extreme Anglin', a site archived from 2008, seems to agree with this: https://web.archive.org/web/20080330034052/https://www.elsanglin.com/role_of_skill.html
+     */
     TC_LOG_DEBUG("entities.player.skills", "Player::UpdateFishingSkill: Player '{}' ({})", GetName(), GetGUID().ToString());
 
     uint32 SkillValue = GetPureSkillValue(SKILL_FISHING);
@@ -6103,8 +6193,19 @@ bool Player::UpdateFishingSkill()
         // @epoch-start
         //m_fishingSteps = 0; // moved down to UpdateSkillPro so the steps only reset if the skillup was a success
         uint32 gathering_skill_gain = sWorld->getIntConfig(CONFIG_SKILL_GAIN_GATHERING);
+        // UpdateSkillPro expects chance as a per mille (i.e. per 1000), not a percentage.
+        uint32 chancePerMille = 1000;
+        
+        // Until and including skill level 75, we've always got 100% chance of skilling up.
+        // After skill level 75, we have a chance of failing to skill up only on the cast that is exactly EQUAL to minimum requred number of casts
+        // We always succeed to skill up once we have done over the mimumum number of casts.
+        if (SkillValue > 75 && m_fishingSteps == stepsNeededToLevelUp)
+        {
+            uint8 excessSkill = SkillValue - (stepsNeededToLevelUp * 25 + 50);
+            chancePerMille -= SkillValue - excessSkill * 40; // as chance is per mille, 4% = 40.
+        }
 
-        return UpdateSkillPro(SKILL_FISHING, 75*10, gathering_skill_gain);
+        return UpdateSkillPro(SKILL_FISHING, chance, gathering_skill_gain);
         // @epoch-end
     }
 
